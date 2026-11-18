@@ -1,131 +1,139 @@
 """GTA VI launch-day Twitch viewer forecaster.
 
-Idea: a launch's hour-1 count anchors a shape. Comparable past launches give
-many hour-1-relative curves; weight the ones whose hour-1 and pre-launch
-behaviour look most like the case, then produce quantiles from the weighted
-distribution of log-ratios at each hour. Uses only the standard library.
+An hour-1 viewer count anchors the forecast. Each comparable supplies a curve
+of log(viewers / hour-1 viewers) for hours 1..24; comparables are weighted by
+how close their day_start is to the case's day_start. Weighted moments of those
+log-ratios give a mean and spread at every forecast hour, which are blended
+with a generic launch-decay prior and turned into five quantiles.
+
+Standard library only.
 """
+
+import datetime
 import json
 import math
 import os
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
+Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
+MIN_VIEWERS = 0.01
+MAX_VIEWERS = 1e9
 
 
-def hourly_map(rows):
-    """Map hour index (1-based from release-day 00:00Z) -> viewers."""
-    out = {}
-    for r in rows:
-        f = r.get("from")
-        if not f:
-            continue
-        # hour index from the row's own 'from' time relative to release day
-        try:
-            import datetime
-            day = datetime.datetime.fromisoformat(r.get("_day_start", "").replace("Z", "+00:00")) if r.get("_day_start") else None
-            t = datetime.datetime.fromisoformat(f.replace("Z", "+00:00"))
-        except Exception:
-            continue
-        if day is not None:
-            h = int((t - day).total_seconds() // 3600) + 1
-            if 1 <= h <= 24:
-                out[h] = max(1.0, float(r.get("viewers") or 0))
-    return out
+def parse_day(value):
+    """Parse an ISO-8601 day_start into an aware datetime."""
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def anchor_viewers(case):
+    """Extract the hour-1 viewer count from a case's `known` field."""
+    known = case.get("known")
+    if isinstance(known, (int, float)):
+        return float(known)
+    if isinstance(known, dict):
+        if "viewers" in known:
+            return float(known["viewers"])
+        for key in ("1", 1):
+            if key in known:
+                return float(known[key])
+    if isinstance(known, list):
+        for item in known:
+            if isinstance(item, dict) and item.get("hour", item.get("h")) in (1, "1"):
+                return float(item["viewers"])
+    raise ValueError("case has no hour-1 viewer count in 'known'")
+
+
+def comparable_rows(comp):
+    """Return the hourly rows of a comparable regardless of the list key."""
+    for key in ("hourly", "hours", "rows", "data"):
+        if isinstance(comp.get(key), list):
+            return comp[key]
+    return []
 
 
 def comparable_curve(comp):
-    """Return (anchor viewers at hour1, list of 24 log-ratios) or None."""
+    """Return {hour: log(viewers/anchor)} for hours 1..24, or None."""
     day_start = comp.get("day_start")
     if not day_start:
         return None
-    try:
-        import datetime
-        day = datetime.datetime.fromisoformat(day_start.replace("Z", "+00:00"))
-    except Exception:
-        return None
-    vals = {}
-    for r in comp.get("hourly") or []:
-        f = r.get("from")
-        if not f:
+    day = parse_day(day_start)
+    viewers = {}
+    for row in comparable_rows(comp):
+        source = row.get("from")
+        if not source or not row.get("viewers"):
             continue
         try:
-            t = datetime.datetime.fromisoformat(f.replace("Z", "+00:00"))
-        except Exception:
+            when = datetime.datetime.fromisoformat(source.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
             continue
-        h = int((t - day).total_seconds() // 3600) + 1
-        if 1 <= h <= 24 and r.get("viewers"):
-            vals[h] = max(1.0, float(r["viewers"]))
-    if 1 not in vals:
+        hour = int((when - day).total_seconds() // 3600) + 1
+        if 1 <= hour <= 24:
+            viewers[hour] = float(row["viewers"])
+    if 1 not in viewers or viewers[1] <= 0:
         return None
-    a = vals[1]
-    curve = {}
-    for h in range(1, 25):
-        if h in vals:
-            curve[h] = math.log(vals[h] / a)
-    return a, curve
+    anchor = viewers[1]
+    return {
+        hour: math.log(value / anchor)
+        for hour, value in viewers.items()
+        if value > 0
+    }
 
 
-def wdistance(case, comp):
-    """Rough similarity between the case's pre-launch history and a comparable."""
-    try:
-        import datetime
-        cd = datetime.datetime.fromisoformat(case["day_start"].replace("Z", "+00:00"))
-        pd = datetime.datetime.fromisoformat(comp["day_start"].replace("Z", "+00:00"))
-    except Exception:
-        return 1.0
-    d = abs((cd - pd).days)
-    # prefer temporally near comparables, and those spanning the same unlock style
-    w = math.exp(-d / 400.0)
-    return max(w, 1e-9)
+def comparable_weight(case_day, comp):
+    """Weight by exponential decay in the distance between day_start values."""
+    if not comp.get("day_start"):
+        return 0.0
+    distance = abs((case_day - parse_day(comp["day_start"])).total_seconds()) / 86400.0
+    return math.exp(-distance / 400.0)
 
 
-def forecast_case(case, name):
-    first = next((k for k in case.get("known", []) if k.get("hour") == 1), None)
-    if first is None:
-        raise ValueError(f"{name}: no hour-1 print")
-    p1 = max(1.0, float(first.get("viewers") or 1))
+def forecast_hours(case):
+    """Return the sorted forecast hours restricted to 2..24."""
+    hours = []
+    for row in case.get("forecast", []):
+        hour = row.get("hour", row.get("h")) if isinstance(row, dict) else row
+        hour = int(hour)
+        if 2 <= hour <= 24:
+            hours.append(hour)
+    return sorted(hours)
 
-    samples = {}  # hour -> list of log-ratio samples
-    weights = {}
-    for comp in case.get("comparables") or []:
-        got = comparable_curve(comp)
-        if not got:
+
+def forecast_case(case):
+    p1 = anchor_viewers(case)
+    case_day = parse_day(case["day_start"])
+
+    samples = {}
+    for comp in case.get("comparables", []) or []:
+        curve = comparable_curve(comp)
+        if not curve:
             continue
-        _, curve = got
-        w = wdistance(case, comp)
-        for h, lr in curve.items():
-            if h < 2:
-                continue
-            samples.setdefault(h, []).append((lr, w))
+        weight = comparable_weight(case_day, comp)
+        if weight <= 0:
+            continue
+        for hour, log_ratio in curve.items():
+            if hour >= 2:
+                samples.setdefault(hour, []).append((log_ratio, weight))
 
     out = []
-    for row in case.get("forecast", []):
-        h = row["hour"]
-        pts = samples.get(h, [])
-        if pts:
-            total = sum(w for _, w in pts)
-            mean = sum(lr * w for lr, w in pts) / total
-            var = sum(w * (lr - mean) ** 2 for lr, w in pts) / total
-            sd = min(0.9, max(0.05, math.sqrt(var)))
+    for hour in forecast_hours(case):
+        points = samples.get(hour, [])
+        if points:
+            total = sum(weight for _, weight in points)
+            mean = sum(value * weight for value, weight in points) / total
+            var = sum(weight * (value - mean) ** 2 for value, weight in points) / total
         else:
-            mean, sd = 0.0, 0.15 * math.sqrt(h - 1)
-        # pulls toward a generic launch decay after the first hours
-        generic = -0.18 * math.log(h)
-        mean = 0.65 * mean + 0.35 * generic
-        q = []
-        for z in Z:
-            v = p1 * math.exp(mean + z * sd)
-            q.append(round(min(1e9, max(0.01, v)), 2))
-        for i in range(1, len(q)):
-            q[i] = max(q[i], q[i-1])
-        out.append({"hour": h, "q": q})
+            mean = 0.0
+            var = 0.0
+        sd = min(0.9, max(0.05, math.sqrt(var)))
+        blended = 0.65 * mean + 0.35 * (-0.18 * math.log(hour))
+        quantiles = [
+            round(min(MAX_VIEWERS, max(MIN_VIEWERS, p1 * math.exp(blended + z * sd))), 2)
+            for z in Z
+        ]
+        quantiles.sort()
+        out.append({"hour": hour, "q": quantiles})
     return {"hours": out}
 
 
@@ -133,9 +141,9 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        result = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(result, separators=(",", ":")) + "\n", encoding="utf-8")
+        result = forecast_case(case)
+        target = OUTPUT_DIR / f"{path.stem}.out"
+        target.write_text(json.dumps(result, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
